@@ -371,10 +371,22 @@ export async function listCallLogs(req, res) {
     ]);
     if (lErr) throw lErr;
 
-    // Index notes by call_log_id for O(n) merge
+    // Index notes by call_log_id for O(n) merge.
+    // Only merge note-specific columns — do NOT spread the entire notes row
+    // because it has its own `id` column which would overwrite the call log's ID.
     const notesByCall = {};
     for (const n of (notes || [])) {
-      notesByCall[n.call_log_id] = n;
+      notesByCall[n.call_log_id] = {
+        interview_notes: n.interview_notes,
+        interview_round: n.interview_round,
+        interview_rating: n.interview_rating,
+        interview_questions: n.interview_questions,
+        interview_topics: n.interview_topics,
+        interview_next_steps: n.interview_next_steps,
+        notes_updated_at: n.notes_updated_at,
+        pending_reason: n.pending_reason,
+        reminder_status: n.reminder_status,
+      };
     }
     const merged = (logs || []).map(log => {
       const n = notesByCall[log.id];
