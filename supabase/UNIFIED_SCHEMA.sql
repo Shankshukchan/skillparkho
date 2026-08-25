@@ -173,6 +173,49 @@ CREATE POLICY "scl_service_all"
 
 
 -- ============================================================================
+-- 4.2. unknown_calls — Calls from numbers NOT in student_hr_contacts
+-- ============================================================================
+-- Every call on the verified (monitored) SIM that is NOT a saved HR contact
+-- is stored here. This keeps student_call_logs clean (only HR calls >20s)
+-- while still giving full visibility of all monitored traffic.
+CREATE TABLE IF NOT EXISTS public.unknown_calls (
+    id                          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    student_id                  TEXT NOT NULL,
+    android_call_log_id         TEXT NULL,
+    phone_number                TEXT NOT NULL,
+    normalized_phone_number     TEXT NOT NULL,
+    call_type                   TEXT NOT NULL
+                                CHECK (call_type IN ('INCOMING','OUTGOING','MISSED','REJECTED')),
+    duration_seconds            INTEGER DEFAULT 0,
+    start_time                  TIMESTAMPTZ NOT NULL,
+    end_time                    TIMESTAMPTZ NOT NULL,
+    sim_subscription_id         TEXT NULL,
+    sim_slot                    INTEGER NULL,
+    created_at                  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_uc_student       ON public.unknown_calls(student_id);
+CREATE INDEX IF NOT EXISTS idx_uc_student_time  ON public.unknown_calls(student_id, start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_uc_phone         ON public.unknown_calls(normalized_phone_number);
+CREATE INDEX IF NOT EXISTS idx_uc_android_id    ON public.unknown_calls(android_call_log_id)
+  WHERE android_call_log_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_uc_dedup         ON public.unknown_calls(
+  student_id, normalized_phone_number, start_time, call_type, duration_seconds
+);
+
+DROP TRIGGER IF EXISTS trg_uc_updated_at ON public.unknown_calls;
+CREATE TRIGGER trg_uc_updated_at
+  BEFORE UPDATE ON public.unknown_calls
+  FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
+
+ALTER TABLE public.unknown_calls ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "uc_service_all" ON public.unknown_calls;
+CREATE POLICY "uc_service_all"
+  ON public.unknown_calls FOR ALL USING (true) WITH CHECK (true);
+
+
+-- ============================================================================
 -- 4.5. student_call_notes — Interview notes / call notes (1:1 with call_logs)
 -- ============================================================================
 -- Separated from student_call_logs so call data and notes have independent

@@ -32,6 +32,7 @@ export const TABLE_CALL_LOGS       = 'student_call_logs';
 export const TABLE_CALL_NOTES      = 'student_call_notes';
 export const TABLE_CALL_RECORDINGS = 'student_call_recordings';
 export const TABLE_INTERVIEW_VIDEOS = 'student_interview_videos';
+export const TABLE_UNKNOWN_CALLS   = 'unknown_calls';
 
 // Health check with cached result (called by /api/health)
 let _healthCache = null;

@@ -263,8 +263,9 @@ export async function requestOtp(req, res) {
     const maskedPhone = `+91 ****${norm.slice(-4)}`;
 
     let message = '';
-    if (sendResult.channel === 'sms') message = `OTP sent to ${maskedPhone} via SMS`;
-    else if (sendResult.channel === 'email') message = `SMS failed, OTP sent to ${maskedEmail} via Email`;
+    if (sendResult.channel === 'whatsapp') message = `OTP sent to ${maskedPhone} via WhatsApp`;
+    else if (sendResult.channel === 'sms') message = `OTP sent to ${maskedPhone} via SMS`;
+    else if (sendResult.channel === 'email') message = `WhatsApp failed, OTP sent to ${maskedEmail} via Email`;
     else message = `OTP generated for ${maskedPhone}. Check console (dev mode)`;
 
     res.json({

@@ -1,5 +1,5 @@
 import express from 'express';
-import { upsertHrContact, listHrContacts, upsertCallLog, listCallLogs, syncAll, deleteHrContact, deleteCallLog, authenticateStudent } from '../controllers/studentDataController.js';
+import { upsertHrContact, listHrContacts, upsertCallLog, listCallLogs, syncAll, deleteHrContact, deleteCallLog, listUnknownCalls, upsertUnknownCall, authenticateStudent } from '../controllers/studentDataController.js';
 
 const router = express.Router();
 
@@ -12,6 +12,8 @@ router.delete('/hr-contacts/:id', deleteHrContact);
 router.post('/call-logs', upsertCallLog);
 router.get('/call-logs', listCallLogs);
 router.delete('/call-logs/:id', deleteCallLog);
+router.get('/unknown-calls', listUnknownCalls);
+router.post('/unknown-calls', upsertUnknownCall);
 router.post('/sync', syncAll);
 
 export default router;

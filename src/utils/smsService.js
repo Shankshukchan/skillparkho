@@ -1,6 +1,82 @@
 import { sendOtpEmail } from './emailService.js';
 
-// SMS Providers: console (dev), fast2sms, twilio, msg91, textlocal
+// Providers: console (dev), telecrm_whatsapp (TeleCRM WhatsApp API), fast2sms (legacy), twilio, msg91
+
+async function sendViaTeleCrmWhatsapp(phone, otp) {
+  const apiKey = process.env.TELECRM_API_KEY || process.env.TELECRM_WHATSAPP_API_KEY;
+  const enterpriseId = process.env.TELECRM_ENTERPRISE_ID;
+  // Allow full URL override, otherwise construct from enterpriseId
+  let url = process.env.TELECRM_WA_URL || process.env.TELECRM_WHATSAPP_URL || process.env.TELECRM_WHATSAPP_API_URL;
+  if (!url) {
+    if (!enterpriseId) return { sent: false, error: 'TELECRM_ENTERPRISE_ID not set' };
+    if (!apiKey) return { sent: false, error: 'TELECRM_API_KEY not set' };
+    url = `https://api.telecrm.in/enterprise/${enterpriseId}/whatsapp/send`;
+  }
+  if (!apiKey) return { sent: false, error: 'TELECRM_API_KEY not set' };
+
+  const normalized = phone.replace(/\D/g, '').slice(-10);
+  const to = `91${normalized}`;
+  const template = process.env.TELECRM_WA_TEMPLATE || process.env.TELECRM_WA_TEMPLATE_NAME || 'otp_verification';
+  const language = process.env.TELECRM_WA_LANGUAGE || 'en';
+  // TeleCRM expects template with OTP param; fallback to simple text if template fails
+  const payloadsToTry = [
+    // Standard WhatsApp template payload
+    {
+      to,
+      type: 'template',
+      template: {
+        name: template,
+        language: { code: language },
+        components: [{ type: 'body', parameters: [{ type: 'text', text: String(otp) }] }],
+      },
+    },
+    // Fallback simple text payload (some TeleCRM setups use this)
+    {
+      to,
+      type: 'text',
+      text: { body: `Your SkillParkho OTP is ${otp}. Valid for 5 minutes. Do not share.` },
+    },
+    // Legacy TeleCRM autoUpdateLead style
+    {
+      phone: to,
+      whatsapp_template: template,
+      otp: String(otp),
+      message: `Your SkillParkho OTP is ${otp}. Valid for 5 minutes.`,
+    },
+  ];
+
+  for (let i = 0; i < payloadsToTry.length; i++) {
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          ...(process.env.TELECRM_API_HEADER ? { 'X-API-KEY': apiKey } : {}),
+        },
+        body: JSON.stringify(payloadsToTry[i]),
+      });
+      const text = await resp.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = { raw: text }; }
+      if (resp.ok) {
+        // TeleCRM often returns {success:true} or {status:'success'} or HTTP 200 with no error
+        const ok = data.success === true || data.status === 'success' || data.sent === true || resp.status === 200;
+        if (ok || i === 0) {
+          // Consider first payload success if HTTP 200 even without explicit success flag
+          return { sent: true, provider: 'telecrm_whatsapp', response: data, payloadIndex: i };
+        }
+      }
+      // If first payload failed with 4xx, try next fallback payload
+      if (i < payloadsToTry.length - 1) continue;
+      return { sent: false, error: data.message || data.error || text.slice(0, 500) };
+    } catch (e) {
+      if (i < payloadsToTry.length - 1) continue;
+      return { sent: false, error: e.message };
+    }
+  }
+  return { sent: false, error: 'TeleCRM WhatsApp send failed after retries' };
+}
 
 async function sendViaFast2SMS(phone, otp) {
   const apiKey = process.env.FAST2SMS_API_KEY;
@@ -77,7 +153,7 @@ async function sendViaMsg91(phone, otp) {
 }
 
 export async function sendSmsOtp(phone, otp) {
-  const provider = (process.env.SMS_PROVIDER || 'console').toLowerCase();
+  const provider = (process.env.SMS_PROVIDER || 'telecrm').toLowerCase();
   const normalized = phone.replace(/\D/g, '').slice(-10);
 
   // Provider priority: explicit provider -> fallback chain
@@ -88,35 +164,42 @@ export async function sendSmsOtp(phone, otp) {
     return { sent: true, provider: 'console', devMode: true, previewOtp: otp };
   }
 
-  if (provider === 'fast2sms') result = await sendViaFast2SMS(normalized, otp);
+  if (provider === 'telecrm' || provider === 'whatsapp' || provider === 'telecrm_whatsapp' || provider === 'wa') {
+    result = await sendViaTeleCrmWhatsapp(normalized, otp);
+  } else if (provider === 'fast2sms') result = await sendViaFast2SMS(normalized, otp);
   else if (provider === 'twilio') result = await sendViaTwilio(normalized, otp);
   else if (provider === 'msg91') result = await sendViaMsg91(normalized, otp);
   else if (provider === 'auto') {
-    // Try fast2sms -> twilio -> msg91 -> console
-    result = await sendViaFast2SMS(normalized, otp);
+    // Try TeleCRM WhatsApp -> fast2sms -> twilio -> msg91
+    result = await sendViaTeleCrmWhatsapp(normalized, otp);
+    if (!result.sent) result = await sendViaFast2SMS(normalized, otp);
     if (!result.sent) result = await sendViaTwilio(normalized, otp);
     if (!result.sent) result = await sendViaMsg91(normalized, otp);
+  } else {
+    // Unknown provider string, try TeleCRM as default
+    result = await sendViaTeleCrmWhatsapp(normalized, otp);
   }
 
   if (result.sent) {
-    console.log(`📱 OTP SMS sent via ${result.provider} to +91${normalized}`);
+    console.log(`📱 OTP WhatsApp sent via ${result.provider} to +91${normalized}`);
     return result;
   }
 
-  console.warn(`📱 SMS via ${provider} failed: ${result.error}`);
+  console.warn(`📱 WhatsApp via ${provider} failed: ${result.error}`);
   // Return failed, caller will try email fallback
   return { sent: false, error: result.error, provider };
 }
 
 export async function sendOtpWithFallback(phone, otp, fallbackEmail) {
-  // 1. Try SMS
+  // 1. Try WhatsApp via TeleCRM
   const smsResult = await sendSmsOtp(phone, otp);
   if (smsResult.sent) {
-    return { sent: true, channel: 'sms', provider: smsResult.provider, smsResult, previewOtp: smsResult.previewOtp };
+    const ch = smsResult.provider === 'telecrm_whatsapp' || smsResult.provider === 'whatsapp' || smsResult.provider === 'wa' ? 'whatsapp' : 'sms';
+    return { sent: true, channel: ch, provider: smsResult.provider, smsResult, previewOtp: smsResult.previewOtp };
   }
 
   // 2. Fallback to Email
-  console.log(`📱 SMS failed (${smsResult.error}), falling back to Email -> ${fallbackEmail}`);
+  console.log(`📱 WhatsApp failed (${smsResult.error}), falling back to Email -> ${fallbackEmail}`);
   if (!fallbackEmail || !fallbackEmail.includes('@')) {
     console.warn('⚠️ No valid fallback email, OTP logged only');
     console.log(`🔐 [FALLBACK OTP] Phone: ${phone} | OTP: ${otp} | Email missing`);

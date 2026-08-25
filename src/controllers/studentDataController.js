@@ -6,6 +6,7 @@ import {
   TABLE_CALL_LOGS,
   TABLE_CALL_NOTES,
   TABLE_CALL_RECORDINGS,
+  TABLE_UNKNOWN_CALLS,
 } from '../config/supabase.js';
 import { validateHrPayload, validateCallLogPayload } from '../utils/validators.js';
 
@@ -239,7 +240,75 @@ export async function upsertCallLog(req, res) {
         reminder_status: l.reminder_status || 'not_required',
       } : null;
 
-      // Dedup: find existing call by android_call_log_id or natural key
+      // Determine if this number is a saved HR
+      let hasSavedHr = !!callPayload.hr_contact_id;
+      if (!hasSavedHr && normalizedPhone) {
+        const { data: hr } = await supabaseAdmin
+          .from(TABLE_STUDENT_HR)
+          .select('id')
+          .eq('student_id', callPayload.student_id)
+          .eq('normalized_phone_number', normalizedPhone)
+          .maybeSingle();
+        if (hr) {
+          hasSavedHr = true;
+          if (!callPayload.hr_contact_id) callPayload.hr_contact_id = hr.id;
+        }
+      }
+
+      // Unknown (not saved) calls go to unknown_calls table (all monitored SIM traffic)
+      if (!hasSavedHr) {
+        // Dedup in unknown_calls
+        let unknownDedupId = null;
+        if (callPayload.android_call_log_id) {
+          const { data: existingU } = await supabaseAdmin
+            .from(TABLE_UNKNOWN_CALLS)
+            .select('id')
+            .eq('student_id', callPayload.student_id)
+            .eq('android_call_log_id', callPayload.android_call_log_id)
+            .maybeSingle();
+          if (existingU) unknownDedupId = existingU.id;
+        }
+        if (!unknownDedupId && normalizedPhone && callPayload.start_time) {
+          const { data: existingU2 } = await supabaseAdmin
+            .from(TABLE_UNKNOWN_CALLS)
+            .select('id')
+            .eq('student_id', callPayload.student_id)
+            .eq('normalized_phone_number', normalizedPhone)
+            .eq('start_time', callPayload.start_time)
+            .eq('call_type', callPayload.call_type)
+            .eq('duration_seconds', callPayload.duration_seconds)
+            .maybeSingle();
+          if (existingU2) unknownDedupId = existingU2.id;
+        }
+        const unknownPayload = {
+          id: unknownDedupId || ensureUuid(l.id),
+          student_id: callPayload.student_id,
+          android_call_log_id: callPayload.android_call_log_id,
+          phone_number: callPayload.phone_number,
+          normalized_phone_number: normalizedPhone,
+          call_type: callPayload.call_type,
+          duration_seconds: callPayload.duration_seconds || 0,
+          start_time: callPayload.start_time,
+          end_time: callPayload.end_time,
+          sim_subscription_id: callPayload.sim_subscription_id,
+          sim_slot: callPayload.sim_slot,
+          created_at: callPayload.created_at,
+          updated_at: callPayload.updated_at,
+        };
+        let { data: uData, error: uError } = await supabaseAdmin
+          .from(TABLE_UNKNOWN_CALLS)
+          .upsert(unknownPayload, { onConflict: 'id' })
+          .select()
+          .maybeSingle();
+        if (uError) {
+          results.push({ success: false, error: uError.message });
+          continue;
+        }
+        results.push({ success: true, data: uData, unknown: true });
+        continue;
+      }
+
+      // Known HR calls: dedup in student_call_logs
       let dedupId = null;
       if (callPayload.android_call_log_id) {
         const { data: existing } = await supabaseAdmin
@@ -264,21 +333,11 @@ export async function upsertCallLog(req, res) {
       }
       if (dedupId) callPayload.id = dedupId;
 
-      // Spec enforcement: only saved-HR calls > 20s go to DB (new calls only)
+      // Only saved-HR calls > 20s go to student_call_logs (new calls only)
       if (!dedupId) {
         const duration = Number(callPayload.duration_seconds) || 0;
-        let hasSavedHr = !!callPayload.hr_contact_id;
-        if (!hasSavedHr && normalizedPhone) {
-          const { data: hr } = await supabaseAdmin
-            .from(TABLE_STUDENT_HR)
-            .select('id')
-            .eq('student_id', callPayload.student_id)
-            .eq('normalized_phone_number', normalizedPhone)
-            .maybeSingle();
-          if (hr) hasSavedHr = true;
-        }
-        if (duration <= 20 || !hasSavedHr) {
-          results.push({ success: false, skipped: true, local_only: true, reason: 'Call stays on device' });
+        if (duration <= 20) {
+          results.push({ success: false, skipped: true, local_only: true, reason: 'Call stays on device (short <=20s)' });
           continue;
         }
       }
@@ -399,7 +458,7 @@ export async function listCallLogs(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /api/app/call-logs/:id
+// DELETE /api/app/call-logs/:id  (now blocked for all - per spec no deletes)
 // ---------------------------------------------------------------------------
 export async function deleteCallLog(req, res) {
   try {
@@ -407,28 +466,89 @@ export async function deleteCallLog(req, res) {
     const { id } = req.params;
     if (!id || !isValidUuid(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
 
-    // Delete call log
-    const { data: deleted } = await supabaseAdmin
-      .from(TABLE_CALL_LOGS)
-      .delete()
-      .eq('id', id)
-      .eq('student_id', studentId)
-      .select('id');
-    let deletedOk = !!(deleted && deleted.length > 0);
-
-    // Delete associated notes, recording
-    await supabaseAdmin.from(TABLE_CALL_NOTES).delete().eq('call_log_id', id);
-    await supabaseAdmin.from(TABLE_CALL_RECORDINGS).delete().eq('call_log_id', id);
-
-    if (!deletedOk) {
-      const { data: check } = await supabaseAdmin
-        .from(TABLE_CALL_LOGS)
-        .select('id')
-        .eq('id', id)
-        .maybeSingle();
-      if (!check) deletedOk = true;
+    // Check if it's an unknown call — also blocked (per spec: unknown not deletable)
+    const { data: unknown } = await supabaseAdmin.from(TABLE_UNKNOWN_CALLS).select('id').eq('id', id).eq('student_id', studentId).maybeSingle();
+    if (unknown) {
+      return res.status(403).json({ success: false, error: 'Stored in database. Cannot be deleted.' });
     }
-    res.json({ success: deletedOk, deleted: deletedOk });
+
+    // For known HR calls, deletion is also now blocked per spec (all calls permanent)
+    // Keep legacy behavior for call_logs but enforce block for qualifiesForDetails equivalent
+    // For backwards compatibility we check if call exists - if so, block delete
+    const { data: existing } = await supabaseAdmin.from(TABLE_CALL_LOGS).select('id').eq('id', id).eq('student_id', studentId).maybeSingle();
+    if (existing) {
+      return res.status(403).json({ success: false, error: 'Stored in database. Cannot be deleted.' });
+    }
+
+    // If not found in either, treat as already deleted (idempotent)
+    res.json({ success: true, deleted: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/unknown-calls  — list unknown calls for student
+// ---------------------------------------------------------------------------
+export async function listUnknownCalls(req, res) {
+  try {
+    const studentId = req.student.id || req.query.student_id;
+    const { data, error } = await supabaseAdmin
+      .from(TABLE_UNKNOWN_CALLS)
+      .select('*')
+      .eq('student_id', studentId)
+      .order('start_time', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/app/unknown-calls — upsert single unknown call (used by direct unknown sync)
+// ---------------------------------------------------------------------------
+export async function upsertUnknownCall(req, res) {
+  try {
+    const body = req.body;
+    const logs = Array.isArray(body) ? body : (body.logs ? body.logs : [body]);
+    const results = [];
+    for (const l of logs) {
+      const vErr = validateCallLogPayload(l);
+      if (vErr) { results.push({ success: false, error: 'Validation failed', details: vErr }); continue; }
+      const normalizedPhone = String(l.normalized_phone_number || l.phone_number).trim().replace(/\D/g, '').slice(-10);
+      const payload = {
+        id: ensureUuid(l.id),
+        student_id: l.student_id,
+        android_call_log_id: l.android_call_log_id || null,
+        phone_number: String(l.phone_number).trim(),
+        normalized_phone_number: normalizedPhone,
+        call_type: l.call_type,
+        duration_seconds: l.duration_seconds || 0,
+        start_time: l.start_time,
+        end_time: l.end_time,
+        sim_subscription_id: l.sim_subscription_id || null,
+        sim_slot: l.sim_slot || 0,
+        created_at: l.created_at || new Date().toISOString(),
+        updated_at: l.updated_at || new Date().toISOString(),
+      };
+      let dedupId = null;
+      if (payload.android_call_log_id) {
+        const { data: e } = await supabaseAdmin.from(TABLE_UNKNOWN_CALLS).select('id').eq('student_id', payload.student_id).eq('android_call_log_id', payload.android_call_log_id).maybeSingle();
+        if (e) dedupId = e.id;
+      }
+      if (!dedupId && normalizedPhone && payload.start_time) {
+        const { data: e2 } = await supabaseAdmin.from(TABLE_UNKNOWN_CALLS).select('id').eq('student_id', payload.student_id).eq('normalized_phone_number', normalizedPhone).eq('start_time', payload.start_time).eq('call_type', payload.call_type).eq('duration_seconds', payload.duration_seconds).maybeSingle();
+        if (e2) dedupId = e2.id;
+      }
+      if (dedupId) payload.id = dedupId;
+      const { data, error } = await supabaseAdmin.from(TABLE_UNKNOWN_CALLS).upsert(payload, { onConflict: 'id' }).select().maybeSingle();
+      if (error) { results.push({ success: false, error: error.message }); continue; }
+      results.push({ success: true, data });
+    }
+    const allOk = results.length > 0 && results.every(r => r.success);
+    res.json({ success: allOk, results });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -452,10 +572,33 @@ export async function syncAll(req, res) {
       hrResults.push(error ? { success: false, error: error.message } : { success: true });
     }
 
-    // Batch call logs (only saved-HR calls)
+    // Batch call logs — route unknown numbers to unknown_calls
     for (const l of callLogs) {
-      if (!l.hr_contact_id && !hrContacts.find(h => h.normalized_phone_number === l.normalized_phone_number)) {
-        callResults.push({ success: false, skipped: 'unknown' });
+      const isUnknown = !l.hr_contact_id && !hrContacts.find(h => h.normalized_phone_number === l.normalized_phone_number);
+      // Check DB for HR existence if payload claims unknown but DB has HR
+      let hasHrInDb = !isUnknown;
+      if (isUnknown && l.normalized_phone_number) {
+        const { data: hr } = await supabaseAdmin.from(TABLE_STUDENT_HR).select('id').eq('student_id', l.student_id || studentId).eq('normalized_phone_number', l.normalized_phone_number).maybeSingle();
+        if (hr) hasHrInDb = true;
+      }
+      if (isUnknown && !hasHrInDb) {
+        // Route to unknown_calls
+        const normalizedPhone = String(l.normalized_phone_number || l.phone_number).replace(/\D/g,'').slice(-10);
+        const unknownPayload = {
+          id: l.id || randomUUID(),
+          student_id: l.student_id || studentId,
+          android_call_log_id: l.android_call_log_id || null,
+          phone_number: String(l.phone_number).trim(),
+          normalized_phone_number: normalizedPhone,
+          call_type: l.call_type,
+          duration_seconds: l.duration_seconds || 0,
+          start_time: l.start_time,
+          end_time: l.end_time,
+          sim_subscription_id: l.sim_subscription_id || null,
+          sim_slot: l.sim_slot || 0,
+        };
+        const { error: uErr } = await supabaseAdmin.from(TABLE_UNKNOWN_CALLS).upsert(unknownPayload, { onConflict: 'id' });
+        callResults.push(uErr ? { success: false, error: uErr.message } : { success: true, unknown: true });
         continue;
       }
 
@@ -504,7 +647,7 @@ export async function syncAll(req, res) {
     }
 
     const hrOk = !hrResults.length || hrResults.every(r => r.success);
-    const callOk = callResults.every(r => r.success || r.skipped === 'unknown');
+    const callOk = callResults.every(r => r.success);
     res.json({ success: hrOk && callOk, hrResults, callResults });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
