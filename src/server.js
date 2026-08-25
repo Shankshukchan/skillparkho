@@ -166,6 +166,10 @@ app.get('/', (req, res) => {
   });
 });
 
+app.get("/cron-job", (req, res) => {
+  console.log("✅ Cron job hit at:", new Date().toLocaleString());
+  res.status(200).send("Cron job executed");
+});
 // ---------------------------------------------------------------------------
 // 7. Routes
 // ---------------------------------------------------------------------------
