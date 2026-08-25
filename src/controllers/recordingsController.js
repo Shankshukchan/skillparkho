@@ -1,0 +1,462 @@
+import { randomUUID } from 'crypto';
+import {
+  supabaseAdmin,
+  TABLE_CALL_LOGS,
+  TABLE_CALL_NOTES,
+  TABLE_STUDENT_HR,
+  TABLE_CALL_RECORDINGS,
+  TABLE_INTERVIEW_VIDEOS,
+} from '../config/supabase.js';
+
+const RECORDING_BUCKET = 'student-call-recordings';
+const VIDEO_BUCKET = 'student-interview-videos';
+
+function sanitizeFilename(name) {
+  if (!name) return `recording_${Date.now()}.m4a`;
+  const clean = String(name).replace(/[^A-Za-z0-9._-]/g, '_');
+  return clean || `recording_${Date.now()}.m4a`;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/app/recordings/upload
+// ---------------------------------------------------------------------------
+export async function uploadRecording(req, res) {
+  try {
+    const studentId = req.student.id;
+    const file = req.file;
+    if (!file) return res.status(400).json({ success: false, error: 'Audio file is required (field: file)' });
+
+    const callLogId = (req.body.call_log_id || req.body.callLogId || '').toString().trim();
+    if (!callLogId) return res.status(400).json({ success: false, error: 'call_log_id is required' });
+
+    const originalFilename = (req.body.original_filename || req.body.originalFilename || file.originalname || 'recording.m4a').toString();
+    const mimeType = (req.body.mime_type || req.body.mimeType || file.mimetype || 'audio/mpeg').toString();
+    const fileSizeBytes = parseInt(req.body.file_size_bytes || req.body.fileSizeBytes || file.size, 10);
+
+    // Validate call belongs to student and is eligible (>20s + saved HR)
+    const { data: callLog } = await supabaseAdmin
+      .from(TABLE_CALL_LOGS)
+      .select('id,student_id,hr_contact_id,normalized_phone_number,duration_seconds,recording_uploaded')
+      .eq('id', callLogId)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!callLog) return res.status(404).json({ success: false, error: 'Call log not found or access denied' });
+    if (callLog.recording_uploaded) return res.status(409).json({ success: false, error: 'This call already has a recording. Uploaded recordings cannot be changed.' });
+    if (callLog.duration_seconds <= 20) return res.status(400).json({ success: false, error: 'Audio uploads are only allowed for saved HR calls longer than 20 seconds.' });
+
+    // Ensure HR contact exists
+    let hasHr = !!callLog.hr_contact_id;
+    if (!hasHr && callLog.normalized_phone_number) {
+      const { data: hr } = await supabaseAdmin
+        .from(TABLE_STUDENT_HR)
+        .select('id')
+        .eq('student_id', studentId)
+        .eq('normalized_phone_number', callLog.normalized_phone_number)
+        .maybeSingle();
+      if (hr) hasHr = true;
+    }
+    if (!hasHr) return res.status(400).json({ success: false, error: 'Cannot upload recording for unknown number. Save HR details first.' });
+
+    // Check existing recording
+    const { data: existingRec } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('id')
+      .eq('call_log_id', callLogId)
+      .maybeSingle();
+    if (existingRec) return res.status(409).json({ success: false, error: 'This call already has a recording. Uploaded recordings cannot be changed.' });
+
+    if (file.size > 150 * 1024 * 1024) return res.status(400).json({ success: false, error: 'File too large (max 150MB)' });
+    const allowedExt = ['.aac', '.m4a', '.mp3', '.wav', '.amr', '.3gp', '.3gpp', '.mp4', '.mpeg'];
+    const lower = originalFilename.toLowerCase();
+    const extOk = allowedExt.some(e => lower.endsWith(e)) || mimeType.startsWith('audio/') || mimeType.startsWith('video/');
+    if (!extOk) return res.status(400).json({ success: false, error: 'Invalid audio file type' });
+
+    const safeName = sanitizeFilename(originalFilename);
+    const storagePath = `${studentId}/${callLogId}/${safeName}`;
+
+    // Upload to storage
+    const { error: uploadErr } = await supabaseAdmin.storage.from(RECORDING_BUCKET).upload(storagePath, file.buffer, {
+      contentType: mimeType || 'audio/mpeg',
+      upsert: false,
+    });
+    if (uploadErr) {
+      if (uploadErr.message?.includes('Duplicate') || uploadErr.code === '23505') {
+        return res.status(409).json({ success: false, error: 'This call already has a recording. Uploaded recordings cannot be changed.' });
+      }
+      return res.status(500).json({ success: false, error: 'Storage upload failed: ' + uploadErr.message });
+    }
+
+    const now = new Date().toISOString();
+    const recId = randomUUID();
+    const payload = {
+      id: recId, student_id: studentId, call_log_id: callLogId,
+      storage_path: storagePath, original_filename: originalFilename,
+      mime_type: mimeType, file_size_bytes: fileSizeBytes || file.size,
+      uploaded_at: now, created_at: now,
+    };
+
+    const { data: recData, error: recErr } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .insert(payload)
+      .select()
+      .maybeSingle();
+    if (recErr) {
+      try { await supabaseAdmin.storage.from(RECORDING_BUCKET).remove([storagePath]); } catch {}
+      if (recErr.code === '23505') {
+        return res.status(409).json({ success: false, error: 'This call already has a recording.' });
+      }
+      return res.status(500).json({ success: false, error: 'Failed to save recording metadata: ' + recErr.message });
+    }
+
+    // Mark call log as uploaded + clear reminder on notes
+    try {
+      await Promise.all([
+        supabaseAdmin
+          .from(TABLE_CALL_LOGS)
+          .update({ recording_uploaded: true, updated_at: now })
+          .eq('id', callLogId)
+          .eq('student_id', studentId),
+        supabaseAdmin
+          .from(TABLE_CALL_NOTES)
+          .update({ reminder_status: 'completed', pending_reason: null, updated_at: now })
+          .eq('call_log_id', callLogId),
+      ]);
+    } catch {}
+
+    return res.json({ success: true, data: recData || payload, storagePath });
+  } catch (e) {
+    console.error('uploadRecording error', e);
+    return res.status(500).json({ success: false, error: e.message || 'Internal server error' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/recordings/playback/:callLogId
+// ---------------------------------------------------------------------------
+export async function getRecordingPlaybackUrl(req, res) {
+  try {
+    const studentId = req.student.id;
+    const callLogId = req.params.callLogId || req.params.id;
+    if (!callLogId) return res.status(400).json({ success: false, error: 'callLogId required' });
+    const ttl = parseInt(req.query.ttl || '3600', 10);
+
+    const { data: rec } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('storage_path,call_log_id,student_id')
+      .eq('call_log_id', callLogId)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!rec) return res.status(404).json({ success: false, error: 'Recording not found' });
+
+    const { data, error } = await supabaseAdmin.storage.from(RECORDING_BUCKET).createSignedUrl(rec.storage_path, ttl);
+    if (error) return res.status(500).json({ success: false, error: 'Failed to create playback URL: ' + error.message });
+    return res.json({ success: true, url: data.signedUrl, storagePath: rec.storage_path });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/recordings?student_id=
+// ---------------------------------------------------------------------------
+export async function listRecordings(req, res) {
+  try {
+    const studentId = req.student.id;
+    const { data, error } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('*')
+      .eq('student_id', studentId)
+      .order('uploaded_at', { ascending: false })
+      .limit(500);
+    if (error) throw error;
+    return res.json({ success: true, data });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/app/storage/signed-url (generic, ownership-verified)
+// ---------------------------------------------------------------------------
+export async function createSignedUrlGeneric(req, res) {
+  try {
+    const { storagePath, bucket, ttl } = req.body;
+    if (!storagePath) return res.status(400).json({ success: false, error: 'storagePath required' });
+    const b = bucket || RECORDING_BUCKET;
+    const t = parseInt(ttl || '3600', 10);
+    const studentId = req.student.id;
+
+    // Verify ownership via DB
+    let owned = false;
+    const { data: rec } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('id')
+      .eq('student_id', studentId)
+      .eq('storage_path', storagePath)
+      .maybeSingle();
+    if (rec) owned = true;
+
+    if (!owned) {
+      const { data: vid } = await supabaseAdmin
+        .from(TABLE_INTERVIEW_VIDEOS)
+        .select('id')
+        .eq('student_id', studentId)
+        .eq('storage_path', storagePath)
+        .maybeSingle();
+      if (vid) owned = true;
+    }
+
+    // Fallback: path starts with studentId
+    if (!owned && storagePath.startsWith(studentId + '/')) owned = true;
+
+    if (!owned) {
+      return res.status(403).json({ success: false, error: 'Access denied to this storage path.' });
+    }
+    const { data, error } = await supabaseAdmin.storage.from(b).createSignedUrl(storagePath, t);
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, url: data.signedUrl });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/app/videos/upload
+// ---------------------------------------------------------------------------
+export async function uploadInterviewVideo(req, res) {
+  try {
+    const studentId = req.student.id;
+    const file = req.file;
+    if (!file) return res.status(400).json({ success: false, error: 'Video file is required' });
+    const stageName = (req.body.stage_name || req.body.stageName || '').toString().trim();
+    if (!stageName) return res.status(400).json({ success: false, error: 'stage_name is required' });
+    const originalFilename = (req.body.original_filename || req.body.originalFilename || file.originalname || 'video.mp4').toString();
+    const mimeType = (req.body.mime_type || req.body.mimeType || file.mimetype || 'video/mp4').toString();
+
+    if (file.size > 150 * 1024 * 1024) return res.status(400).json({ success: false, error: 'File too large (max 150MB)' });
+    const allowedVideoExt = ['.mp4', '.mov', '.webm', '.3gp', '.mkv', '.avi', '.quicktime'];
+    const lower = originalFilename.toLowerCase();
+    const extOk = allowedVideoExt.some(e => lower.endsWith(e)) || mimeType.startsWith('video/');
+    if (!extOk) return res.status(400).json({ success: false, error: 'Invalid video file type' });
+
+    const safeName = sanitizeFilename(originalFilename);
+    const storagePath = `${studentId}/videos/${Date.now()}_${safeName}`;
+
+    const { error: uploadErr } = await supabaseAdmin.storage.from(VIDEO_BUCKET).upload(storagePath, file.buffer, {
+      contentType: mimeType || 'video/mp4',
+      upsert: false,
+    });
+    if (uploadErr) return res.status(500).json({ success: false, error: 'Video upload failed: ' + uploadErr.message });
+
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const payload = {
+      id, student_id: studentId, stage_name: stageName,
+      storage_path: storagePath, original_filename: originalFilename,
+      mime_type: mimeType, file_size_bytes: file.size,
+      uploaded_at: now, created_at: now,
+    };
+    const { data, error } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .insert(payload)
+      .select()
+      .maybeSingle();
+    if (error) {
+      try { await supabaseAdmin.storage.from(VIDEO_BUCKET).remove([storagePath]); } catch {}
+      return res.status(500).json({ success: false, error: 'Failed to save video metadata: ' + error.message });
+    }
+    return res.json({ success: true, data });
+  } catch (e) {
+    console.error('uploadInterviewVideo error', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/videos
+// ---------------------------------------------------------------------------
+export async function listInterviewVideos(req, res) {
+  try {
+    const studentId = req.student.id;
+    const { data, error } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .select('*')
+      .eq('student_id', studentId)
+      .order('uploaded_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    return res.json({ success: true, data });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/app/videos/:id
+// ---------------------------------------------------------------------------
+export async function deleteInterviewVideo(req, res) {
+  try {
+    const studentId = req.student.id;
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+    const { data: video } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .select('storage_path,student_id')
+      .eq('id', id)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!video) return res.status(404).json({ success: false, error: 'Video not found' });
+    try { await supabaseAdmin.storage.from(VIDEO_BUCKET).remove([video.storage_path]); } catch {}
+    const { error } = await supabaseAdmin.from(TABLE_INTERVIEW_VIDEOS).delete().eq('id', id).eq('student_id', studentId);
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, deleted: true });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/videos/playback/:id
+// ---------------------------------------------------------------------------
+export async function getVideoPlaybackUrl(req, res) {
+  try {
+    const studentId = req.student.id;
+    const id = req.params.id;
+    const ttl = parseInt(req.query.ttl || '3600', 10);
+    const { data: video } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .select('storage_path,student_id')
+      .eq('id', id)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!video) return res.status(404).json({ success: false, error: 'Video not found' });
+    const { data, error } = await supabaseAdmin.storage.from(VIDEO_BUCKET).createSignedUrl(video.storage_path, ttl);
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, url: data.signedUrl, storagePath: video.storage_path });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/recordings/stream/:callLogId (chunked proxy with Range)
+// ---------------------------------------------------------------------------
+export async function streamRecording(req, res) {
+  try {
+    const studentId = req.student.id;
+    const callLogId = req.params.callLogId || req.params.id;
+    if (!callLogId) return res.status(400).json({ success: false, error: 'callLogId required' });
+
+    const { data: rec } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('storage_path,mime_type,original_filename,file_size_bytes')
+      .eq('call_log_id', callLogId)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!rec) return res.status(404).json({ success: false, error: 'Recording not found' });
+
+    const { data: signed, error } = await supabaseAdmin.storage.from(RECORDING_BUCKET).createSignedUrl(rec.storage_path, 3600);
+    if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create stream URL' });
+
+    const range = req.headers.range;
+    const headers = {};
+    if (range) headers['Range'] = range;
+    const fetchRes = await fetch(signed.signedUrl, { headers });
+    if (!fetchRes.ok && fetchRes.status !== 206) {
+      return res.status(fetchRes.status).json({ success: false, error: 'Storage fetch failed' });
+    }
+    res.setHeader('Content-Type', rec.mime_type || fetchRes.headers.get('content-type') || 'audio/mpeg');
+    const contentLength = fetchRes.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    const contentRange = fetchRes.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    if (fetchRes.headers.get('content-disposition')) res.setHeader('Content-Disposition', fetchRes.headers.get('content-disposition'));
+    res.status(fetchRes.status);
+
+    if (fetchRes.body) {
+      const reader = fetchRes.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.writableEnded) {
+            await new Promise((resolve, reject) => { res.write(value, (err) => err ? reject(err) : resolve()); });
+          }
+        }
+        res.end();
+      } catch (e) {
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
+      }
+    } else {
+      const buf = await fetchRes.arrayBuffer();
+      res.end(Buffer.from(buf));
+    }
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
+    res.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/app/videos/stream/:id (chunked proxy with Range)
+// ---------------------------------------------------------------------------
+export async function streamVideo(req, res) {
+  try {
+    const studentId = req.student.id;
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+
+    const { data: video } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .select('storage_path,mime_type,original_filename,file_size_bytes')
+      .eq('id', id)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!video) return res.status(404).json({ success: false, error: 'Video not found' });
+
+    const { data: signed, error } = await supabaseAdmin.storage.from(VIDEO_BUCKET).createSignedUrl(video.storage_path, 3600);
+    if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create stream URL' });
+
+    const range = req.headers.range;
+    const headers = {};
+    if (range) headers['Range'] = range;
+    const fetchRes = await fetch(signed.signedUrl, { headers });
+    if (!fetchRes.ok && fetchRes.status !== 206) {
+      return res.status(fetchRes.status).json({ success: false, error: 'Storage fetch failed' });
+    }
+    res.setHeader('Content-Type', video.mime_type || fetchRes.headers.get('content-type') || 'video/mp4');
+    const cl = fetchRes.headers.get('content-length');
+    if (cl) res.setHeader('Content-Length', cl);
+    const cr = fetchRes.headers.get('content-range');
+    if (cr) res.setHeader('Content-Range', cr);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.status(fetchRes.status);
+
+    if (fetchRes.body) {
+      const reader = fetchRes.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.writableEnded) {
+            await new Promise((resolve, reject) => res.write(value, (err) => err ? reject(err) : resolve()));
+          }
+        }
+        res.end();
+      } catch (e) {
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
+      }
+    } else {
+      const buf = await fetchRes.arrayBuffer();
+      res.end(Buffer.from(buf));
+    }
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
+    res.end();
+  }
+}

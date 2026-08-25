@@ -1,0 +1,35 @@
+{
+  "name": "skillparkho-admin-backend",
+  "version": "1.0.0",
+  "description": "SkillParkho HR Tracker - Admin Backend for Verified Contacts (Node.js + Express + Supabase)",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "lint": "echo \"no lint\""
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "csv-parse": "^5.5.6",
+    "csv-stringify": "^6.5.1",
+    "dotenv": "^16.6.0",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.5.0",
+    "googleapis": "^176.0.0",
+    "helmet": "^7.1.0",
+    "joi": "^17.13.3",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^9.0.5",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.12"
+  }
+}
