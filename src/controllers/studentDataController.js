@@ -97,8 +97,10 @@ export async function upsertHrContact(req, res) {
       }
     }
     const allOk = results.length > 0 && results.every(r => r.success);
+    if (res.headersSent) return;
     res.json({ success: allOk, results });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -116,8 +118,10 @@ export async function listHrContacts(req, res) {
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) throw error;
+    if (res.headersSent) return;
     res.json({ success: true, data });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -174,8 +178,10 @@ export async function deleteHrContact(req, res) {
         .maybeSingle();
       if (!check) deletedOk = true;
     }
+    if (res.headersSent) return;
     res.json({ success: deletedOk, deleted: deletedOk, cascaded: !!normalized });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -404,8 +410,10 @@ export async function upsertCallLog(req, res) {
       results.push({ success: true, data });
     }
     const allOk = results.length > 0 && results.every(r => r.success);
+    if (res.headersSent) return;
     res.json({ success: allOk, results });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -451,8 +459,10 @@ export async function listCallLogs(req, res) {
       const n = notesByCall[log.id];
       return n ? { ...log, ...n } : log;
     });
+    if (res.headersSent) return;
     res.json({ success: true, data: merged });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -481,8 +491,10 @@ export async function deleteCallLog(req, res) {
     }
 
     // If not found in either, treat as already deleted (idempotent)
+    if (res.headersSent) return;
     res.json({ success: true, deleted: true });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -500,8 +512,10 @@ export async function listUnknownCalls(req, res) {
       .order('start_time', { ascending: false })
       .limit(200);
     if (error) throw error;
+    if (res.headersSent) return;
     res.json({ success: true, data });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -548,8 +562,10 @@ export async function upsertUnknownCall(req, res) {
       results.push({ success: true, data });
     }
     const allOk = results.length > 0 && results.every(r => r.success);
+    if (res.headersSent) return;
     res.json({ success: allOk, results });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
@@ -650,6 +666,7 @@ export async function syncAll(req, res) {
     const callOk = callResults.every(r => r.success);
     res.json({ success: hrOk && callOk, hrResults, callResults });
   } catch (err) {
+    if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
   }
 }
