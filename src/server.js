@@ -17,6 +17,14 @@ import recordingsRoutes from './routes/recordings.js';
 dotenv.config();
 
 const app = express();
+// Trust proxy: required for correct IP via X-Forwarded-For on Render/Railway.
+// TRUST_PROXY=0 local, 1 single proxy (Render/Railway default), 2 double proxy.
+// Host-agnostic: change via env when migrating without code change.
+const trustProxyEnv = process.env.TRUST_PROXY;
+const trustProxy = trustProxyEnv !== undefined && trustProxyEnv !== ''
+  ? (isNaN(Number(trustProxyEnv)) ? trustProxyEnv : Number(trustProxyEnv))
+  : (process.env.NODE_ENV === 'production' ? 1 : 0);
+app.set('trust proxy', trustProxy);
 const PORT = process.env.PORT || 4000;
 
 // ---------------------------------------------------------------------------

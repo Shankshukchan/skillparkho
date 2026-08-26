@@ -274,17 +274,14 @@ export async function requestOtp(req, res) {
 
     console.log(`OTP for ${norm} (${allowed.full_name || ''}, ${studentEmail || 'no-email'}) = ${otp} via ${sendResult.channel} provider=${sendResult.provider || sendResult.emailResult?.provider || 'unknown'}`);
 
-    const isDev = process.env.NODE_ENV !== 'production' || (!process.env.RESEND_API_KEY && !process.env.RESEND_API_TOKEN && !process.env.SMTP_HOST);
+    const isDev = process.env.NODE_ENV !== 'production' || (!process.env.RESEND_API_KEY && !process.env.RESEND_API_TOKEN);
     const maskedEmail = studentEmail ? maskEmail(studentEmail) : '';
     const maskedPhone = `+91 ****${norm.slice(-4)}`;
 
     let message = '';
     if (sendResult.channel === 'email') {
-      // Resend email is now the PRIMARY channel
       message = `OTP sent to ${maskedEmail} via Email (Resend)`;
-    } else if (sendResult.channel === 'whatsapp') message = `OTP sent to ${maskedPhone} via WhatsApp`;
-    else if (sendResult.channel === 'sms') message = `OTP sent to ${maskedPhone} via SMS`;
-    else message = `OTP generated for ${maskedPhone}. Check console (dev mode)`;
+    } else message = `OTP generated for ${maskedPhone}. Check console (dev mode)`;
 
     res.json({
       success: true, message, channel: sendResult.channel,
@@ -292,7 +289,8 @@ export async function requestOtp(req, res) {
       expiresInSeconds: OTP_EXPIRY_MIN * 60,
       resendAvailableInSeconds: OTP_RESEND_SECONDS,
       ...(isDev || sendResult.previewOtp || sendResult.fallbackLogged ? { previewOtp: otp, devMode: true } : {}),
-      ...(sendResult.smsError ? { smsError: sendResult.smsError } : {}),
+      ...(sendResult.error ? { emailError: sendResult.error } : {}),
+      ...(sendResult.emailError ? { emailError: sendResult.emailError } : {}),
       student: {
         id: allowed.id || `sheet-${norm}`,
         phone_number: allowed.phone_number || norm,
