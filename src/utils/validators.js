@@ -57,6 +57,13 @@ export function validateJobPosition(selected, other){
   } else if (!jobPositions.includes(selected)) return 'invalid job_position_called_for';
   return null;
 }
+export function validateHrEmail(v){
+  if (v === undefined || v === null || String(v).trim() === '') return null; // optional
+  const t = String(v).trim();
+  if (t.length > 254) return 'hr_email must be ≤254 chars';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(t)) return 'hr_email must be a valid email';
+  return null;
+}
 export function validateHrPayload(p, isUpdate=false){
   const errs={};
   if (!isUpdate || p.phone_number!==undefined) {
@@ -64,7 +71,8 @@ export function validateHrPayload(p, isUpdate=false){
   }
   if (!isUpdate || p.hr_name!==undefined) { const e=validateHrName(p.hr_name); if(e) errs.hr_name=e; }
   if (!isUpdate || p.company_name!==undefined) { const e=validateCompany(p.company_name); if(e) errs.company_name=e; }
-  if (p.location!==undefined) { const e=validateLocation(p.location); if(e) errs.location=e; }
+  if (p.hr_email!==undefined) { const e=validateHrEmail(p.hr_email); if(e) errs.hr_email=e; }
+  if (!isUpdate || p.location!==undefined) { const e=validateLocation(p.location, true); if(e) errs.location=e; }
   if (p.hr_designation!==undefined) { const e=validateDesignation(p.hr_designation); if(e) errs.hr_designation=e; }
   if (!isUpdate || p.job_position_called_for!==undefined) {
     // For backend, other is same as job_position if not Other? Just validate against list or allow custom if not in list

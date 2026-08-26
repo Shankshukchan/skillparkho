@@ -190,36 +190,81 @@ export async function sendSmsOtp(phone, otp) {
   return { sent: false, error: result.error, provider };
 }
 
-export async function sendOtpWithFallback(phone, otp, fallbackEmail) {
-  // 1. Try WhatsApp via TeleCRM
+export async function sendOtpWithFallback(phone, otp, fallbackEmail, fullName = '') {
+  // PRIMARY: Resend email to student's Sheet email (required flow)
+  // If RESEND_API_KEY is set, OTP goes via Resend to the email from Google Sheet.
+  const hasResend = !!(process.env.RESEND_API_KEY || process.env.RESEND_API_TOKEN);
+  const isPlaceholderEmail = fallbackEmail && (fallbackEmail.startsWith('noemail_') || fallbackEmail.includes('placeholder.test'));
+  const hasValidEmail = fallbackEmail && fallbackEmail.includes('@') && !isPlaceholderEmail;
+
+  if (hasValidEmail) {
+    // When Resend is configured, email is the PRIMARY channel — try it first
+    if (hasResend) {
+      console.log(`📧 Primary Resend OTP -> ${fallbackEmail} for phone ${phone}`);
+      const emailResult = await sendOtpEmail(fallbackEmail, otp, phone, fullName);
+      if (emailResult.sent || emailResult.devMode || emailResult.fallbackLogged) {
+        return {
+          sent: true,
+          channel: 'email',
+          provider: emailResult.provider || 'resend',
+          emailResult,
+          previewOtp: emailResult.preview || (emailResult.devMode ? otp : undefined),
+          fallback: false,
+        };
+      }
+      console.warn(`📧 Resend email failed (${emailResult.error}), trying WhatsApp fallback for ${phone}`);
+      // Fall through to WhatsApp if Resend failed
+    } else {
+      // No Resend key: still try email via SMTP as primary when valid email exists,
+      // but keep WhatsApp as secondary if SMTP also missing (dev log).
+      // For production without Resend, we attempt WhatsApp first then email to preserve old behavior,
+      // unless OTP_EMAIL_PRIMARY is set.
+      const primaryEmail = (process.env.OTP_EMAIL_PRIMARY || '').toLowerCase() === 'true' || hasResend;
+      if (primaryEmail) {
+        const emailResult = await sendOtpEmail(fallbackEmail, otp, phone, fullName);
+        if (emailResult.sent || emailResult.devMode || emailResult.fallbackLogged) {
+          return {
+            sent: true,
+            channel: 'email',
+            provider: 'email',
+            emailResult,
+            previewOtp: emailResult.preview || otp,
+            fallback: false,
+          };
+        }
+      }
+    }
+  } else {
+    console.warn(`⚠️ No valid student email from Sheet for phone ${phone} — cannot send via Resend; will try WhatsApp`);
+  }
+
+  // 2. Try WhatsApp via TeleCRM (secondary / fallback when email fails or not configured)
   const smsResult = await sendSmsOtp(phone, otp);
   if (smsResult.sent) {
     const ch = smsResult.provider === 'telecrm_whatsapp' || smsResult.provider === 'whatsapp' || smsResult.provider === 'wa' ? 'whatsapp' : 'sms';
     return { sent: true, channel: ch, provider: smsResult.provider, smsResult, previewOtp: smsResult.previewOtp };
   }
 
-  // 2. Fallback to Email
-  console.log(`📱 WhatsApp failed (${smsResult.error}), falling back to Email -> ${fallbackEmail}`);
-  if (!fallbackEmail || !fallbackEmail.includes('@')) {
-    console.warn('⚠️ No valid fallback email, OTP logged only');
-    console.log(`🔐 [FALLBACK OTP] Phone: ${phone} | OTP: ${otp} | Email missing`);
-    return { sent: false, channel: 'none', smsError: smsResult.error, emailError: 'No valid email', previewOtp: otp, fallbackLogged: true };
+  // 3. Final fallback to Email (if not already tried as primary)
+  if (hasValidEmail) {
+    console.log(`📱 WhatsApp failed (${smsResult.error}), falling back to Email -> ${fallbackEmail}`);
+    const emailResult = await sendOtpEmail(fallbackEmail, otp, phone, fullName);
+    if (emailResult.sent || emailResult.devMode || emailResult.fallbackLogged) {
+      return {
+        sent: true,
+        channel: 'email',
+        provider: 'email',
+        smsError: smsResult.error,
+        emailResult,
+        previewOtp: emailResult.preview || otp,
+        fallback: true,
+      };
+    }
+    console.log(`🔐 [BOTH FAILED OTP] Phone: ${phone} | Email: ${fallbackEmail} | OTP: ${otp}`);
+    return { sent: false, channel: 'none', smsError: smsResult.error, emailError: emailResult.error, previewOtp: otp, fallbackLogged: true };
   }
 
-  const emailResult = await sendOtpEmail(fallbackEmail, otp, phone);
-  if (emailResult.sent || emailResult.devMode || emailResult.fallbackLogged) {
-    return {
-      sent: true,
-      channel: 'email',
-      provider: 'email',
-      smsError: smsResult.error,
-      emailResult,
-      previewOtp: emailResult.preview || otp,
-      fallback: true,
-    };
-  }
-
-  // Both failed, but still log OTP for dev
-  console.log(`🔐 [BOTH FAILED OTP] Phone: ${phone} | Email: ${fallbackEmail} | OTP: ${otp}`);
-  return { sent: false, channel: 'none', smsError: smsResult.error, emailError: emailResult.error, previewOtp: otp, fallbackLogged: true };
+  console.warn('⚠️ No valid fallback email, OTP logged only');
+  console.log(`🔐 [FALLBACK OTP] Phone: ${phone} | OTP: ${otp} | Email missing`);
+  return { sent: false, channel: 'none', smsError: smsResult.error, emailError: 'No valid email — add student email in Google Sheet', previewOtp: otp, fallbackLogged: true };
 }

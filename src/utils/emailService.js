@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import { sendOtpViaResend } from './resendService.js';
 
 let transporter = null;
 
@@ -24,7 +25,21 @@ function getTransporter() {
   return transporter;
 }
 
-export async function sendOtpEmail(toEmail, otp, phone) {
+export async function sendOtpEmail(toEmail, otp, phone, fullName = '') {
+  // Prefer Resend if configured — primary OTP channel is Resend to student's Sheet email
+  if (process.env.RESEND_API_KEY || process.env.RESEND_API_TOKEN) {
+    try {
+      const r = await sendOtpViaResend(toEmail, otp, phone, fullName);
+      if (r.sent) return r;
+      // If Resend failed but we are in dev, still allow preview flow
+      if (r.preview || r.fallbackLogged) return r;
+      // Otherwise fall through to SMTP fallback
+      console.warn('Resend failed, falling back to SMTP:', r.error);
+    } catch (e) {
+      console.warn('Resend exception, falling back to SMTP:', e.message);
+    }
+  }
+
   const from = process.env.FROM_EMAIL || process.env.SMTP_USER || 'noreply@skillparkho.com';
   const subject = `Your SkillParkho OTP is ${otp} - Valid for 5 minutes`;
   const html = `
@@ -34,7 +49,7 @@ export async function sendOtpEmail(toEmail, otp, phone) {
       <p style="margin:4px 0 0;color:#BFDBFE;font-size:13px">Secure Email Verification</p>
     </div>
     <div style="padding:28px">
-      <p style="color:#94A3B8;font-size:14px;margin:0 0 8px">Hello,</p>
+      <p style="color:#94A3B8;font-size:14px;margin:0 0 8px">Hello${fullName ? ' ' + fullName : ''},</p>
       <p style="color:#E2E8F0;font-size:14px;line-height:1.6;margin:0 0 16px">
         You requested to log in with your mobile number <b style="color:white">${phone}</b>. Use the OTP below to continue. It expires in <b>5 minutes</b>.
       </p>
@@ -65,8 +80,8 @@ export async function sendOtpEmail(toEmail, otp, phone) {
   try {
     await tx.verify().catch(() => {});
     const info = await tx.sendMail({ from, to: toEmail, subject, html, text });
-    console.log(`📧 OTP email sent to ${toEmail} (phone ${phone}) msgId=${info.messageId}`);
-    return { sent: true, messageId: info.messageId };
+    console.log(`📧 OTP email sent via SMTP to ${toEmail} (phone ${phone}) msgId=${info.messageId}`);
+    return { sent: true, messageId: info.messageId, provider: 'smtp', channel: 'email' };
   } catch (err) {
     console.error('📧 OTP email failed, falling back to log:', err.message);
     console.log(`📧 [FALLBACK OTP] To: ${toEmail} | OTP: ${otp}`);

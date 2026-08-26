@@ -250,22 +250,40 @@ export async function requestOtp(req, res) {
       await deleteOtp(recentOtp);
     }
 
+    // Validate that Sheet has an email for this student — Resend OTP requires it
+    const studentEmail = (allowed.email || '').trim();
+    const isPlaceholder = studentEmail.startsWith('noemail_') || studentEmail.includes('placeholder.test');
+    const emailValid = studentEmail && studentEmail.includes('@') && studentEmail.includes('.') && !isPlaceholder;
+    // If email missing/invalid and Resend is the primary, block with helpful message
+    // (but allow WhatsApp fallback when Resend not configured and email missing — dev mode)
+    const hasResend = !!(process.env.RESEND_API_KEY || process.env.RESEND_API_TOKEN);
+    if (!emailValid && hasResend) {
+      return res.status(400).json({
+        success: false,
+        error: 'No email found for this number in SkillParkho records (Google Sheet). Please contact SkillParkho Support to add your email in the Sheet.',
+        maskedEmail: '',
+        maskedPhone: `+91 ****${norm.slice(-4)}`,
+      });
+    }
+
     const otp = String(100000 + Math.floor(Math.random() * 900000));
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MIN * 60 * 1000).toISOString();
 
-    await storeOtp(norm, allowed.email || '', otp, expiresAt);
-    const sendResult = await sendOtpWithFallback(norm, otp, allowed.email);
+    await storeOtp(norm, studentEmail || '', otp, expiresAt);
+    const sendResult = await sendOtpWithFallback(norm, otp, studentEmail, allowed.full_name || '');
 
-    console.log(`OTP for ${norm} (${allowed.full_name || ''}) = ${otp} via ${sendResult.channel}`);
+    console.log(`OTP for ${norm} (${allowed.full_name || ''}, ${studentEmail || 'no-email'}) = ${otp} via ${sendResult.channel} provider=${sendResult.provider || sendResult.emailResult?.provider || 'unknown'}`);
 
-    const isDev = process.env.NODE_ENV !== 'production' || !process.env.SMTP_HOST;
-    const maskedEmail = allowed.email ? maskEmail(allowed.email) : '';
+    const isDev = process.env.NODE_ENV !== 'production' || (!process.env.RESEND_API_KEY && !process.env.RESEND_API_TOKEN && !process.env.SMTP_HOST);
+    const maskedEmail = studentEmail ? maskEmail(studentEmail) : '';
     const maskedPhone = `+91 ****${norm.slice(-4)}`;
 
     let message = '';
-    if (sendResult.channel === 'whatsapp') message = `OTP sent to ${maskedPhone} via WhatsApp`;
+    if (sendResult.channel === 'email') {
+      // Resend email is now the PRIMARY channel
+      message = `OTP sent to ${maskedEmail} via Email (Resend)`;
+    } else if (sendResult.channel === 'whatsapp') message = `OTP sent to ${maskedPhone} via WhatsApp`;
     else if (sendResult.channel === 'sms') message = `OTP sent to ${maskedPhone} via SMS`;
-    else if (sendResult.channel === 'email') message = `WhatsApp failed, OTP sent to ${maskedEmail} via Email`;
     else message = `OTP generated for ${maskedPhone}. Check console (dev mode)`;
 
     res.json({

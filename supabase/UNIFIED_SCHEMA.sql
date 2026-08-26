@@ -100,12 +100,14 @@ CREATE TABLE IF NOT EXISTS public.student_hr_contacts (
     normalized_phone_number     TEXT NOT NULL,
     hr_name                     TEXT NOT NULL,
     company_name                TEXT NOT NULL,
+    hr_email                    TEXT DEFAULT NULL,
     location                    TEXT NOT NULL DEFAULT '',
     hr_designation              TEXT NOT NULL DEFAULT '',
     job_position_called_for     TEXT NOT NULL DEFAULT 'Other',
     created_at                  TIMESTAMPTZ DEFAULT NOW(),
     updated_at                  TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT uq_student_hr_phone UNIQUE (student_id, normalized_phone_number)
+    CONSTRAINT uq_student_hr_phone UNIQUE (student_id, normalized_phone_number),
+    CONSTRAINT chk_hr_email_format CHECK (hr_email IS NULL OR hr_email = '' OR hr_email ~* '^[^@\s]+@[^@\s]+\.[^@\s]+$')
 );
 
 CREATE INDEX IF NOT EXISTS idx_shc_student   ON public.student_hr_contacts(student_id);

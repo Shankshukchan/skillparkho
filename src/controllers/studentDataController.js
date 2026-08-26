@@ -63,12 +63,15 @@ export async function upsertHrContact(req, res) {
           : String(c.phone_number).trim().replace(/\D/g, '').slice(-10),
         hr_name: String(c.hr_name).trim(),
         company_name: String(c.company_name).trim(),
+        hr_email: c.hr_email ? String(c.hr_email).trim().toLowerCase() : null,
         location: (c.location || '').trim(),
         hr_designation: (c.hr_designation || '').trim(),
         job_position_called_for: String(c.job_position_called_for || 'Other').trim(),
         created_at: c.created_at || new Date().toISOString(),
         updated_at: c.updated_at || new Date().toISOString(),
       };
+      // Treat empty string as null for optional email
+      if (payload.hr_email === '' ) payload.hr_email = null;
       if (!payload.phone_number || !payload.hr_name || !payload.company_name) {
         results.push({ success: false, error: 'Missing required fields', payload });
         continue;
@@ -89,6 +92,32 @@ export async function upsertHrContact(req, res) {
           .select()
           .maybeSingle();
         data = upd.data; error = upd.error;
+      }
+      // hr_email column may not exist on older DBs — retry without it
+      if (error && error.message?.includes('hr_email')) {
+        const fb = { ...payload };
+        delete fb.hr_email;
+        const retry = await supabaseAdmin
+          .from(TABLE_STUDENT_HR)
+          .upsert(fb, { onConflict: 'id' })
+          .select()
+          .maybeSingle();
+        if (!retry.error && retry.data) {
+          data = retry.data; error = null;
+          // Still treat as success but warn that email was ignored until migration runs
+          console.warn(`hr_email column missing — saved HR without email for ${payload.normalized_phone_number}. Run SUPABASE_ADD_HR_EMAIL.sql`);
+        } else if (retry.error?.code === '23505') {
+          const upd2 = await supabaseAdmin
+            .from(TABLE_STUDENT_HR)
+            .update(fb)
+            .eq('student_id', fb.student_id)
+            .eq('normalized_phone_number', fb.normalized_phone_number)
+            .select()
+            .maybeSingle();
+          data = upd2.data; error = upd2.error;
+        } else {
+          error = retry.error;
+        }
       }
       if (error) {
         results.push({ success: false, error: error.message, payload });
@@ -582,9 +611,20 @@ export async function syncAll(req, res) {
     // Batch HR contacts
     for (const c of hrContacts) {
       const payload = { ...c, student_id: c.student_id || studentId };
-      const { error } = await supabaseAdmin
+      // Normalize optional hr_email
+      if (payload.hr_email !== undefined) {
+        const trimmed = String(payload.hr_email).trim();
+        payload.hr_email = trimmed ? trimmed.toLowerCase() : null;
+        if (payload.hr_email === '') payload.hr_email = null;
+      }
+      let { error } = await supabaseAdmin
         .from(TABLE_STUDENT_HR)
         .upsert(payload, { onConflict: 'id' });
+      if (error && error.message?.includes('hr_email')) {
+        const fb = { ...payload }; delete fb.hr_email;
+        const retry = await supabaseAdmin.from(TABLE_STUDENT_HR).upsert(fb, { onConflict: 'id' });
+        error = retry.error;
+      }
       hrResults.push(error ? { success: false, error: error.message } : { success: true });
     }
 
