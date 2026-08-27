@@ -233,7 +233,7 @@ export async function uploadInterviewVideo(req, res) {
     const originalFilename = (req.body.original_filename || req.body.originalFilename || file.originalname || 'video.mp4').toString();
     const mimeType = (req.body.mime_type || req.body.mimeType || file.mimetype || 'video/mp4').toString();
 
-    if (file.size > 150 * 1024 * 1024) return res.status(400).json({ success: false, error: 'File too large (max 150MB)' });
+    if (file.size > 700 * 1024 * 1024) return res.status(400).json({ success: false, error: 'File too large (max 700MB)' });
     const allowedVideoExt = ['.mp4', '.mov', '.webm', '.3gp', '.mkv', '.avi', '.quicktime'];
     const lower = originalFilename.toLowerCase();
     const extOk = allowedVideoExt.some(e => lower.endsWith(e)) || mimeType.startsWith('video/');

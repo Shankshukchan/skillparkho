@@ -85,7 +85,7 @@ const otpLimiter = rateLimit({
 // ---------------------------------------------------------------------------
 // 4. Request timeout middleware (prevents hung requests from blocking workers)
 // ---------------------------------------------------------------------------
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10); // 30s default
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '600000', 10); // 10 min default (supports up to 700MB video uploads)
 app.use((req, res, next) => {
   req.setTimeout(REQUEST_TIMEOUT_MS, () => {
     if (!res.headersSent) {

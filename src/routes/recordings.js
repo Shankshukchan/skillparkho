@@ -21,7 +21,7 @@ router.use(authenticateStudent);
 
 const memUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 160 * 1024 * 1024 },
+  limits: { fileSize: 700 * 1024 * 1024 },
 });
 
 // Recordings (call recordings) - chunked streaming
