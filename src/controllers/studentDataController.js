@@ -7,6 +7,7 @@ import {
   TABLE_CALL_NOTES,
   TABLE_CALL_RECORDINGS,
   TABLE_UNKNOWN_CALLS,
+  TABLE_ALLOWED_USERS,
 } from '../config/supabase.js';
 import { validateHrPayload, validateCallLogPayload } from '../utils/validators.js';
 
@@ -705,6 +706,46 @@ export async function syncAll(req, res) {
     const hrOk = !hrResults.length || hrResults.every(r => r.success);
     const callOk = callResults.every(r => r.success);
     res.json({ success: hrOk && callOk, hrResults, callResults });
+  } catch (err) {
+    if (res.headersSent) return;
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/app/activity/opened  — record the time the student last opened the app
+// ---------------------------------------------------------------------------
+export async function recordAppOpened(req, res) {
+  try {
+    // The student JWT carries the normalized phone; the whitelist table is
+    // keyed by normalized_phone_number.
+    const phone = req.student?.phone;
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Missing student phone in token' });
+    }
+
+    // Best-effort: also preserve any client-supplied timestamp (e.g. captured
+    // offline) but default to server now().
+    const openedAt = (req.body && req.body.opened_at) || new Date().toISOString();
+
+    const { error } = await supabaseAdmin
+      .from(TABLE_ALLOWED_USERS)
+      .update({ last_opened_at: openedAt })
+      .eq('normalized_phone_number', phone);
+
+    // If the migration hasn't been applied yet (column missing), don't break
+    // the app — just report success so the client isn't spammed with errors.
+    if (error) {
+      const msg = error.message || '';
+      if (msg.includes('last_opened_at') || msg.includes('42703') || msg.includes('column')) {
+        console.warn('recordAppOpened: last_opened_at column missing — run ADD_LAST_OPENED_AT.sql');
+        return res.json({ success: true, skipped: true, reason: 'column_missing' });
+      }
+      return res.status(500).json({ success: false, error: msg });
+    }
+
+    if (res.headersSent) return;
+    res.json({ success: true, last_opened_at: openedAt });
   } catch (err) {
     if (res.headersSent) return;
     res.status(500).json({ success: false, error: err.message });
