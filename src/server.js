@@ -239,11 +239,6 @@ const server = app.listen(PORT, '0.0.0.0', {
 }, () => {
   console.log(`
   SkillParkho Admin Backend v2.0.0 running
-  Local:   http://localhost:${PORT}
-  Health:  http://localhost:${PORT}/api/health
-  Env:     ${process.env.NODE_ENV || 'development'}
-  Supabase: ${process.env.SUPABASE_URL}
-  Admin:   ${process.env.ADMIN_EMAIL}
   `);
 });
 
