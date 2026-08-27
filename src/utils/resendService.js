@@ -46,7 +46,7 @@ export async function sendOtpViaResend(toEmail, otp, phone, fullName = '') {
   const html = `
   <div style="font-family:Inter,Arial,sans-serif;max-width:600px;margin:0 auto;background:#0F172A;color:#E2E8F0;border-radius:16px;overflow:hidden;border:1px solid #1E293B">
     <div style="background:linear-gradient(135deg,#2563EB,#4F46E5);padding:24px;text-align:center">
-      <h1 style="margin:0;color:white;font-size:22px">SkillParkho HR Tracker</h1>
+      <h1 style="margin:0;color:white;font-size:22px">SkillParkho Placement</h1>
       <p style="margin:4px 0 0;color:#BFDBFE;font-size:13px">Secure Email Verification</p>
     </div>
     <div style="padding:28px">
@@ -61,7 +61,7 @@ export async function sendOtpViaResend(toEmail, otp, phone, fullName = '') {
         </div>
       </div>
       <p style="color:#64748B;font-size:12px;text-align:center;margin:16px 0 0">
-        This OTP was sent to <b style="color:#94A3B8">${cleanEmail}</b> — the email registered for your number in SkillParkho records (Google Sheet).<br/>
+        This OTP was sent to <b style="color:#94A3B8">${cleanEmail}</b> — the email registered for your number in SkillParkho records.<br/>
         Do not share this code. If you didn't request it, please ignore this email.
       </p>
       <div style="margin-top:24px;padding:12px;background:#020617;border-radius:8px;border:1px solid #1E293B">

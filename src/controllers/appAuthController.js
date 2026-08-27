@@ -400,7 +400,10 @@ export async function verifyOtp(req, res) {
       batch_name: allowed.batch_name || 'SkillParkho Student',
       role: 'student',
     };
-    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
+    // Long-lived student JWT; the app proactively refreshes it (see
+    // /api/auth/refresh) so a user stays logged in until explicit logout or
+    // their sheet access is removed.
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.STUDENT_JWT_EXPIRES_IN || '30d' });
 
     res.json({
       success: true, message: 'OTP verified successfully', token,
@@ -511,6 +514,51 @@ export async function supabaseSession(req, res) {
   } catch (err) {
     console.error('supabaseSession', err);
     res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/auth/refresh
+// Proactively re-issues a student JWT before it expires, and re-checks that
+// the student is still whitelisted/active. A 403 (ACCESS_REMOVED) lets the app
+// force a logout when access is revoked from the sheet; 401 means the token is
+// invalid/expired and the user must re-login. This keeps a user logged in until
+// they explicitly log out or their sheet access is removed.
+// ---------------------------------------------------------------------------
+export async function refreshStudentToken(req, res) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, code: 'NO_TOKEN', error: 'Missing token' });
+  }
+  const token = authHeader.split(' ')[1];
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
+    return res.status(401).json({ success: false, code: 'TOKEN_INVALID', error: 'Token expired or invalid' });
+  }
+  if (decoded.role !== 'student') {
+    return res.status(403).json({ success: false, code: 'FORBIDDEN', error: 'Not a student token' });
+  }
+  try {
+    const allowed = await findAllowedUser(decoded.phone);
+    if (!allowed || allowed._blocked || allowed.is_active === false) {
+      return res.status(403).json({ success: false, code: 'ACCESS_REMOVED', error: 'Access removed' });
+    }
+    const payload = {
+      id: allowed.id || decoded.id,
+      phone: decoded.phone,
+      email: allowed.email || decoded.email || '',
+      full_name: allowed.full_name || decoded.full_name || 'Student',
+      course: allowed.course || decoded.course || '',
+      batch_name: allowed.batch_name || decoded.batch_name || 'SkillParkho Student',
+      role: 'student',
+    };
+    const newToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.STUDENT_JWT_EXPIRES_IN || '30d' });
+    return res.json({ success: true, token: newToken });
+  } catch (err) {
+    console.error('refreshStudentToken', err);
+    return res.status(500).json({ success: false, code: 'SERVER_ERROR', error: err.message });
   }
 }
 
