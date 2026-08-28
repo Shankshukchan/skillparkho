@@ -37,15 +37,21 @@ async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType,
   // Use the storage client's authenticated fetch (it injects apikey + Authorization),
   // not the global fetch — global headers carry no credentials.
   const authedFetch = supabaseAdmin.storage.fetch;
-  const storageUrl = supabaseAdmin.storage.url;            // https://<project>/storage/v1
-  const createUrl = `${storageUrl}/upload/resumable`;
 
+  // Supabase's TUS endpoint performs best against the direct storage hostname.
+  const base = new URL(supabaseAdmin.storage.url); // https://<project>/storage/v1
+  if (base.hostname.endsWith('.supabase.co')) {
+    const projectId = base.hostname.split('.')[0];
+    base.hostname = `${projectId}.storage.supabase.co`;
+  }
+  const createUrl = `${base.origin}/storage/v1/upload/resumable`;
+
+  // TUS Upload-Metadata: Supabase expects these exact key names.
   const uploadMetadata = [
-    `bucket ${b64(bucket)}`,
-    `key ${b64(storagePath)}`,
+    `bucketName ${b64(bucket)}`,
+    `objectName ${b64(storagePath)}`,
     `contentType ${b64(mimeType || 'application/octet-stream')}`,
     `cacheControl ${b64('3600')}`,
-    `upsert ${b64('false')}`,
   ].join(',');
 
   const createRes = await authedFetch(createUrl, {
@@ -54,6 +60,7 @@ async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType,
       'Tus-Resumable': '1.0.0',
       'Upload-Length': String(fileSize),
       'Upload-Metadata': uploadMetadata,
+      'x-upsert': 'false',
     },
   });
   if (createRes.status !== 201) {
@@ -62,10 +69,11 @@ async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType,
   }
   let location = createRes.headers.get('location');
   if (!location) throw new Error('Resumable upload response missing Location header');
-  if (!/^https?:\/\//i.test(location)) location = new URL(location, storageUrl).toString();
+  if (!/^https?:\/\//i.test(location)) location = new URL(location, base).toString();
 
-  // Upload in fixed-size chunks (streamed from disk, so RAM stays bounded).
-  const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB
+  // Supabase requires 6MB chunks (do not change). Each chunk is streamed from
+  // disk, so RAM stays bounded regardless of total file size.
+  const CHUNK_SIZE = 6 * 1024 * 1024; // 6MB
   let offset = 0;
   while (offset < fileSize) {
     const end = Math.min(offset + CHUNK_SIZE, fileSize) - 1;
