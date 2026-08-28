@@ -26,15 +26,56 @@ export async function ensureStorageBucketLimits() {
   ];
   for (const [bucket, size] of targets) {
     try {
+      // Make sure the bucket exists first — `updateBucket` fails (silently, via
+      // a warning) if it doesn't, leaving the default limit in place and causing
+      // every upload > the default to 413. `createBucket` is a no-op if present.
+      const { error: createErr } = await supabaseAdmin.storage.createBucket(bucket, {
+        public: false,
+        fileSizeLimit: size,
+      });
+      if (createErr && !/already exists/i.test(createErr.message)) {
+        console.warn(`[storage] createBucket "${bucket}" warning: ${createErr.message}`);
+      }
+
       const { error } = await supabaseAdmin.storage.updateBucket(bucket, { fileSizeLimit: size });
       if (error) {
         console.warn(`[storage] could not raise file_size_limit for bucket "${bucket}": ${error.message}`);
+      }
+
+      // Re-read the bucket so we can confirm the limit actually took effect.
+      // Some Supabase plans cap file_size_limit below what we request; if the
+      // effective limit is smaller than our target we warn loudly so the 413s
+      // are explainable instead of mysterious.
+      const { data: info, error: getErr } = await supabaseAdmin.storage.getBucket(bucket);
+      if (getErr) {
+        console.warn(`[storage] could not read bucket "${bucket}": ${getErr.message}`);
       } else {
-        console.log(`[storage] bucket "${bucket}" file_size_limit set to ${size} bytes`);
+        const effective = info?.file_size_limit;
+        if (!effective || effective < size) {
+          console.warn(
+            `[storage] bucket "${bucket}" effective file_size_limit is ${effective ?? 'unset'} bytes ` +
+            `(requested ${size}). Uploads larger than this will 413. If this is below your app cap, ` +
+            `your Supabase plan may cap file size — upgrade the plan or lower the app limit.`
+          );
+        } else {
+          console.log(`[storage] bucket "${bucket}" file_size_limit confirmed at ${effective} bytes`);
+        }
       }
     } catch (e) {
       console.warn(`[storage] ensureStorageBucketLimits failed for "${bucket}": ${e.message}`);
     }
+  }
+}
+
+// Returns the effective per-object file size limit (bytes) for a bucket, or null
+// if it cannot be determined. Used to produce clear 413 errors client-side.
+export async function getBucketLimit(bucket) {
+  try {
+    const { data, error } = await supabaseAdmin.storage.getBucket(bucket);
+    if (error) return null;
+    return data?.file_size_limit ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -89,6 +130,18 @@ async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType,
   });
   if (createRes.status !== 201) {
     const body = await createRes.text().catch(() => '');
+    // 413 "Maximum size exceeded" means the requested Upload-Length is larger
+    // than the bucket's effective file_size_limit (Supabase plan cap or unset
+    // bucket limit). Surface the actual limit so the caller can react cleanly.
+    if (createRes.status === 413) {
+      const limit = await getBucketLimit(bucket);
+      const limitMb = limit ? `${(limit / 1024 / 1024).toFixed(0)}MB` : 'unknown';
+      throw new Error(
+        `File too large for storage bucket "${bucket}" (limit ${limitMb}). ` +
+        `The bucket size limit is lower than this file's ${(fileSize / 1024 / 1024).toFixed(0)}MB. ` +
+        `Raise the Supabase bucket file_size_limit / upgrade your plan.`
+      );
+    }
     throw new Error(`Resumable session create failed (${createRes.status}): ${body}`);
   }
   let location = createRes.headers.get('location');
@@ -255,7 +308,8 @@ export async function uploadRecording(req, res) {
   } catch (e) {
     console.error('uploadRecording error', e);
     await safeUnlink(req.file?.path);
-    return res.status(500).json({ success: false, error: e.message || 'Internal server error' });
+    const status = /file too large for storage bucket/i.test(e.message) ? 413 : 500;
+    return res.status(status).json({ success: false, error: e.message || 'Internal server error' });
   }
 }
 
@@ -396,7 +450,8 @@ export async function uploadInterviewVideo(req, res) {
   } catch (e) {
     console.error('uploadInterviewVideo error', e);
     await safeUnlink(req.file?.path);
-    return res.status(500).json({ success: false, error: e.message || 'Internal server error' });
+    const status = /file too large for storage bucket/i.test(e.message) ? 413 : 500;
+    return res.status(status).json({ success: false, error: e.message || 'Internal server error' });
   }
 }
 
