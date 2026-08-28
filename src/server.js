@@ -13,6 +13,7 @@ import allowedUsersRoutes from './routes/allowedUsers.js';
 import appAuthRoutes from './routes/appAuth.js';
 import studentDataRoutes from './routes/studentData.js';
 import recordingsRoutes from './routes/recordings.js';
+import { ensureStorageBucketLimits } from './controllers/recordingsController.js';
 
 dotenv.config();
 
@@ -194,6 +195,12 @@ app.use('/api', allowedUsersRoutes);
 app.use('/api', appAuthRoutes);
 app.use('/api/app', studentDataRoutes);
 app.use('/api/app', recordingsRoutes);
+
+// Raise Supabase bucket file_size_limit so large audio/video uploads aren't
+// rejected with 413. Fire-and-forget; failures are logged, not fatal.
+ensureStorageBucketLimits().catch((e) => {
+  console.warn('[storage] ensureStorageBucketLimits error:', e.message);
+});
 
 // ---------------------------------------------------------------------------
 // 8. 404 handler

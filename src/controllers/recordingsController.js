@@ -14,6 +14,30 @@ import {
 const RECORDING_BUCKET = 'student-call-recordings';
 const VIDEO_BUCKET = 'student-interview-videos';
 
+// Supabase buckets have a `file_size_limit`. If it is lower than our app limits
+// the resumable upload is rejected with 413 "Maximum size exceeded". We raise
+// the bucket limits at startup so large audio/video uploads are permitted.
+// App-level enforcement still caps audio at 150MB and video at 700MB, so we
+// give a little headroom here to avoid off-by-a-few-bytes rejections.
+export async function ensureStorageBucketLimits() {
+  const targets = [
+    [VIDEO_BUCKET, 800 * 1024 * 1024],     // 800MB headroom over the 700MB app cap
+    [RECORDING_BUCKET, 200 * 1024 * 1024], // 200MB headroom over the 150MB app cap
+  ];
+  for (const [bucket, size] of targets) {
+    try {
+      const { error } = await supabaseAdmin.storage.updateBucket(bucket, { fileSizeLimit: size });
+      if (error) {
+        console.warn(`[storage] could not raise file_size_limit for bucket "${bucket}": ${error.message}`);
+      } else {
+        console.log(`[storage] bucket "${bucket}" file_size_limit set to ${size} bytes`);
+      }
+    } catch (e) {
+      console.warn(`[storage] ensureStorageBucketLimits failed for "${bucket}": ${e.message}`);
+    }
+  }
+}
+
 function sanitizeFilename(name) {
   if (!name) return `recording_${Date.now()}.m4a`;
   const clean = String(name).replace(/[^A-Za-z0-9._-]/g, '_');
