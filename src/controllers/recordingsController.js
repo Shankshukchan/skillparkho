@@ -25,19 +25,94 @@ async function safeUnlink(p) {
   try { await unlink(p); } catch {}
 }
 
-// Stream a file from local disk straight to Supabase Storage without ever
-// loading the whole thing into RAM. The storage SDK accepts a (web) Readable
-// stream body and uploads it in chunks with `duplex: "half"`. We pass an
-// explicit Content-Length so the request is not sent with chunked transfer
-// encoding (which the storage backend may reject for object uploads).
-async function streamUploadToStorage(bucket, storagePath, filePath, mimeType, contentLength) {
-  const nodeStream = createReadStream(filePath);
-  const webStream = Readable.toWeb(nodeStream);
-  return supabaseAdmin.storage.from(bucket).upload(storagePath, webStream, {
-    contentType: mimeType,
-    upsert: false,
-    headers: { 'Content-Length': String(contentLength) },
+// Standard (non-resumable) Supabase upload caps a single object at 50MB. Large
+// audio/video must go through the TUS resumable endpoint, which is not exposed
+// by this version of @supabase/storage-js. We implement it manually here,
+// streaming the temp file from disk in fixed chunks so RAM stays flat.
+function b64(str) {
+  return Buffer.from(String(str), 'utf8').toString('base64');
+}
+
+async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType, fileSize) {
+  // Use the storage client's authenticated fetch (it injects apikey + Authorization),
+  // not the global fetch — global headers carry no credentials.
+  const authedFetch = supabaseAdmin.storage.fetch;
+  const storageUrl = supabaseAdmin.storage.url;            // https://<project>/storage/v1
+  const createUrl = `${storageUrl}/upload/resumable`;
+
+  const uploadMetadata = [
+    `bucket ${b64(bucket)}`,
+    `key ${b64(storagePath)}`,
+    `contentType ${b64(mimeType || 'application/octet-stream')}`,
+    `cacheControl ${b64('3600')}`,
+    `upsert ${b64('false')}`,
+  ].join(',');
+
+  const createRes = await authedFetch(createUrl, {
+    method: 'POST',
+    headers: {
+      'Tus-Resumable': '1.0.0',
+      'Upload-Length': String(fileSize),
+      'Upload-Metadata': uploadMetadata,
+    },
   });
+  if (createRes.status !== 201) {
+    const body = await createRes.text().catch(() => '');
+    throw new Error(`Resumable session create failed (${createRes.status}): ${body}`);
+  }
+  let location = createRes.headers.get('location');
+  if (!location) throw new Error('Resumable upload response missing Location header');
+  if (!/^https?:\/\//i.test(location)) location = new URL(location, storageUrl).toString();
+
+  // Upload in fixed-size chunks (streamed from disk, so RAM stays bounded).
+  const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB
+  let offset = 0;
+  while (offset < fileSize) {
+    const end = Math.min(offset + CHUNK_SIZE, fileSize) - 1;
+    const chunkLen = end - offset + 1;
+    const nodeStream = createReadStream(filePath, { start: offset, end });
+    const webStream = Readable.toWeb(nodeStream);
+    const patchRes = await authedFetch(location, {
+      method: 'PATCH',
+      headers: {
+        'Tus-Resumable': '1.0.0',
+        'Upload-Offset': String(offset),
+        'Content-Type': 'application/offset+octet-stream',
+        'Content-Length': String(chunkLen),
+      },
+      body: webStream,
+      duplex: 'half',
+    });
+    if (patchRes.status !== 204) {
+      const body = await patchRes.text().catch(() => '');
+      throw new Error(`Resumable chunk upload failed at offset ${offset} (${patchRes.status}): ${body}`);
+    }
+    const reported = parseInt(patchRes.headers.get('upload-offset') || '', 10);
+    offset = Number.isFinite(reported) && reported > offset ? reported : end + 1;
+  }
+  if (offset !== fileSize) {
+    throw new Error(`Resumable upload incomplete: server received ${offset}/${fileSize} bytes`);
+  }
+  return { data: { path: storagePath }, error: null };
+}
+
+// Upload a temp file to Supabase Storage as a stream. Uses the TUS resumable
+// endpoint (no 50MB cap, RAM-bounded). Falls back to the standard streaming
+// upload only for small files / environments where resumable is unavailable.
+async function streamUploadToStorage(bucket, storagePath, filePath, mimeType, fileSize) {
+  try {
+    return await resumableUploadToStorage(bucket, storagePath, filePath, mimeType, fileSize);
+  } catch (e) {
+    if (fileSize > 50 * 1024 * 1024) throw e; // standard endpoint caps at 50MB
+    console.warn('resumable upload failed, falling back to standard stream upload:', e.message);
+    const nodeStream = createReadStream(filePath);
+    const webStream = Readable.toWeb(nodeStream);
+    return supabaseAdmin.storage.from(bucket).upload(storagePath, webStream, {
+      contentType: mimeType,
+      upsert: false,
+      headers: { 'Content-Length': String(fileSize) },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
