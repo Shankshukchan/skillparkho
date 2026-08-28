@@ -1,3 +1,6 @@
+import { createReadStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { Readable, pipeline } from 'node:stream';
 import { randomUUID } from 'crypto';
 import {
   supabaseAdmin,
@@ -15,6 +18,26 @@ function sanitizeFilename(name) {
   if (!name) return `recording_${Date.now()}.m4a`;
   const clean = String(name).replace(/[^A-Za-z0-9._-]/g, '_');
   return clean || `recording_${Date.now()}.m4a`;
+}
+
+async function safeUnlink(p) {
+  if (!p) return;
+  try { await unlink(p); } catch {}
+}
+
+// Stream a file from local disk straight to Supabase Storage without ever
+// loading the whole thing into RAM. The storage SDK accepts a (web) Readable
+// stream body and uploads it in chunks with `duplex: "half"`. We pass an
+// explicit Content-Length so the request is not sent with chunked transfer
+// encoding (which the storage backend may reject for object uploads).
+async function streamUploadToStorage(bucket, storagePath, filePath, mimeType, contentLength) {
+  const nodeStream = createReadStream(filePath);
+  const webStream = Readable.toWeb(nodeStream);
+  return supabaseAdmin.storage.from(bucket).upload(storagePath, webStream, {
+    contentType: mimeType,
+    upsert: false,
+    headers: { 'Content-Length': String(contentLength) },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -74,11 +97,9 @@ export async function uploadRecording(req, res) {
     const safeName = sanitizeFilename(originalFilename);
     const storagePath = `${studentId}/${callLogId}/${safeName}`;
 
-    // Upload to storage
-    const { error: uploadErr } = await supabaseAdmin.storage.from(RECORDING_BUCKET).upload(storagePath, file.buffer, {
-      contentType: mimeType || 'audio/mpeg',
-      upsert: false,
-    });
+    // Upload to storage by streaming the temp file (keeps RAM flat).
+    const { error: uploadErr } = await streamUploadToStorage(RECORDING_BUCKET, storagePath, file.path, mimeType || 'audio/mpeg', file.size);
+    await safeUnlink(file.path);
     if (uploadErr) {
       if (uploadErr.message?.includes('Duplicate') || uploadErr.code === '23505') {
         return res.status(409).json({ success: false, error: 'This call already has a recording. Uploaded recordings cannot be changed.' });
@@ -126,6 +147,7 @@ export async function uploadRecording(req, res) {
     return res.json({ success: true, data: recData || payload, storagePath });
   } catch (e) {
     console.error('uploadRecording error', e);
+    await safeUnlink(req.file?.path);
     return res.status(500).json({ success: false, error: e.message || 'Internal server error' });
   }
 }
@@ -242,10 +264,8 @@ export async function uploadInterviewVideo(req, res) {
     const safeName = sanitizeFilename(originalFilename);
     const storagePath = `${studentId}/videos/${Date.now()}_${safeName}`;
 
-    const { error: uploadErr } = await supabaseAdmin.storage.from(VIDEO_BUCKET).upload(storagePath, file.buffer, {
-      contentType: mimeType || 'video/mp4',
-      upsert: false,
-    });
+    const { error: uploadErr } = await streamUploadToStorage(VIDEO_BUCKET, storagePath, file.path, mimeType || 'video/mp4', file.size);
+    await safeUnlink(file.path);
     if (uploadErr) return res.status(500).json({ success: false, error: 'Video upload failed: ' + uploadErr.message });
 
     const now = new Date().toISOString();
@@ -268,7 +288,8 @@ export async function uploadInterviewVideo(req, res) {
     return res.json({ success: true, data });
   } catch (e) {
     console.error('uploadInterviewVideo error', e);
-    return res.status(500).json({ success: false, error: e.message });
+    await safeUnlink(req.file?.path);
+    return res.status(500).json({ success: false, error: e.message || 'Internal server error' });
   }
 }
 
@@ -339,6 +360,61 @@ export async function getVideoPlaybackUrl(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared streaming helper (Range-aware, chunk-by-chunk, backpressured)
+// ---------------------------------------------------------------------------
+// Streams a Supabase Storage object to the response without buffering it in RAM.
+// - Honors HTTP Range requests so audio/video players can seek.
+// - Uses stream.pipeline() which applies backpressure automatically, so memory
+//   usage stays flat regardless of file size (150MB audio / 700MB video).
+// - Aborts the upstream fetch when the client disconnects.
+async function pipeStorageToResponse(req, res, signedUrl, meta, { disposition } = {}) {
+  try {
+    const range = req.headers.range;
+    const headers = {};
+    if (range) headers['Range'] = range;
+
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+
+    const fetchRes = await fetch(signedUrl, { headers, signal: controller.signal });
+    if (!fetchRes.ok && fetchRes.status !== 206) {
+      return res.status(fetchRes.status).json({ success: false, error: 'Storage fetch failed' });
+    }
+
+    res.status(fetchRes.status);
+    res.setHeader('Content-Type', meta.mimeType || fetchRes.headers.get('content-type') || 'application/octet-stream');
+    const cl = fetchRes.headers.get('content-length');
+    if (cl) res.setHeader('Content-Length', cl);
+    const cr = fetchRes.headers.get('content-range');
+    if (cr) res.setHeader('Content-Range', cr);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    if (disposition) {
+      const fname = meta.filename ? `; filename="${meta.filename.replace(/["\r\n]/g, '_')}"` : '';
+      res.setHeader('Content-Disposition', `${disposition}${fname}`);
+    } else if (fetchRes.headers.get('content-disposition')) {
+      res.setHeader('Content-Disposition', fetchRes.headers.get('content-disposition'));
+    }
+
+    if (!fetchRes.body) {
+      const buf = await fetchRes.arrayBuffer();
+      return res.end(Buffer.from(buf));
+    }
+
+    const nodeStream = Readable.fromWeb(fetchRes.body);
+    nodeStream.on('error', () => controller.abort());
+    await pipeline(nodeStream, res);
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      if (!res.headersSent) res.end();
+      return;
+    }
+    if (!res.headersSent) return res.status(500).json({ success: false, error: e.message || 'Stream failed' });
+    res.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/app/recordings/stream/:callLogId (chunked proxy with Range)
 // ---------------------------------------------------------------------------
 export async function streamRecording(req, res) {
@@ -358,42 +434,40 @@ export async function streamRecording(req, res) {
     const { data: signed, error } = await supabaseAdmin.storage.from(RECORDING_BUCKET).createSignedUrl(rec.storage_path, 3600);
     if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create stream URL' });
 
-    const range = req.headers.range;
-    const headers = {};
-    if (range) headers['Range'] = range;
-    const fetchRes = await fetch(signed.signedUrl, { headers });
-    if (!fetchRes.ok && fetchRes.status !== 206) {
-      return res.status(fetchRes.status).json({ success: false, error: 'Storage fetch failed' });
-    }
-    res.setHeader('Content-Type', rec.mime_type || fetchRes.headers.get('content-type') || 'audio/mpeg');
-    const contentLength = fetchRes.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    const contentRange = fetchRes.headers.get('content-range');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    if (fetchRes.headers.get('content-disposition')) res.setHeader('Content-Disposition', fetchRes.headers.get('content-disposition'));
-    res.status(fetchRes.status);
+    await pipeStorageToResponse(req, res, signed.signedUrl, {
+      mimeType: rec.mime_type || 'audio/mpeg',
+      filename: rec.original_filename,
+    }, {});
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
+    res.end();
+  }
+}
 
-    if (fetchRes.body) {
-      const reader = fetchRes.body.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!res.writableEnded) {
-            await new Promise((resolve, reject) => { res.write(value, (err) => err ? reject(err) : resolve()); });
-          }
-        }
-        res.end();
-      } catch (e) {
-        if (!res.headersSent) res.status(500).end();
-        else res.end();
-      }
-    } else {
-      const buf = await fetchRes.arrayBuffer();
-      res.end(Buffer.from(buf));
-    }
+// ---------------------------------------------------------------------------
+// GET /api/app/recordings/download/:callLogId (buffered download stream)
+// ---------------------------------------------------------------------------
+export async function downloadRecording(req, res) {
+  try {
+    const studentId = req.student.id;
+    const callLogId = req.params.callLogId || req.params.id;
+    if (!callLogId) return res.status(400).json({ success: false, error: 'callLogId required' });
+
+    const { data: rec } = await supabaseAdmin
+      .from(TABLE_CALL_RECORDINGS)
+      .select('storage_path,mime_type,original_filename,file_size_bytes')
+      .eq('call_log_id', callLogId)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!rec) return res.status(404).json({ success: false, error: 'Recording not found' });
+
+    const { data: signed, error } = await supabaseAdmin.storage.from(RECORDING_BUCKET).createSignedUrl(rec.storage_path, 3600);
+    if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create download URL' });
+
+    await pipeStorageToResponse(req, res, signed.signedUrl, {
+      mimeType: rec.mime_type || 'audio/mpeg',
+      filename: rec.original_filename,
+    }, { disposition: 'attachment' });
   } catch (e) {
     if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
     res.end();
@@ -420,41 +494,40 @@ export async function streamVideo(req, res) {
     const { data: signed, error } = await supabaseAdmin.storage.from(VIDEO_BUCKET).createSignedUrl(video.storage_path, 3600);
     if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create stream URL' });
 
-    const range = req.headers.range;
-    const headers = {};
-    if (range) headers['Range'] = range;
-    const fetchRes = await fetch(signed.signedUrl, { headers });
-    if (!fetchRes.ok && fetchRes.status !== 206) {
-      return res.status(fetchRes.status).json({ success: false, error: 'Storage fetch failed' });
-    }
-    res.setHeader('Content-Type', video.mime_type || fetchRes.headers.get('content-type') || 'video/mp4');
-    const cl = fetchRes.headers.get('content-length');
-    if (cl) res.setHeader('Content-Length', cl);
-    const cr = fetchRes.headers.get('content-range');
-    if (cr) res.setHeader('Content-Range', cr);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.status(fetchRes.status);
+    await pipeStorageToResponse(req, res, signed.signedUrl, {
+      mimeType: video.mime_type || 'video/mp4',
+      filename: video.original_filename,
+    }, {});
+  } catch (e) {
+    if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
+    res.end();
+  }
+}
 
-    if (fetchRes.body) {
-      const reader = fetchRes.body.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!res.writableEnded) {
-            await new Promise((resolve, reject) => res.write(value, (err) => err ? reject(err) : resolve()));
-          }
-        }
-        res.end();
-      } catch (e) {
-        if (!res.headersSent) res.status(500).end();
-        else res.end();
-      }
-    } else {
-      const buf = await fetchRes.arrayBuffer();
-      res.end(Buffer.from(buf));
-    }
+// ---------------------------------------------------------------------------
+// GET /api/app/videos/download/:id (buffered download stream)
+// ---------------------------------------------------------------------------
+export async function downloadVideo(req, res) {
+  try {
+    const studentId = req.student.id;
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+
+    const { data: video } = await supabaseAdmin
+      .from(TABLE_INTERVIEW_VIDEOS)
+      .select('storage_path,mime_type,original_filename,file_size_bytes')
+      .eq('id', id)
+      .eq('student_id', studentId)
+      .maybeSingle();
+    if (!video) return res.status(404).json({ success: false, error: 'Video not found' });
+
+    const { data: signed, error } = await supabaseAdmin.storage.from(VIDEO_BUCKET).createSignedUrl(video.storage_path, 3600);
+    if (error || !signed?.signedUrl) return res.status(500).json({ success: false, error: 'Failed to create download URL' });
+
+    await pipeStorageToResponse(req, res, signed.signedUrl, {
+      mimeType: video.mime_type || 'video/mp4',
+      filename: video.original_filename,
+    }, { disposition: 'attachment' });
   } catch (e) {
     if (!res.headersSent) return res.status(500).json({ success: false, error: e.message });
     res.end();
