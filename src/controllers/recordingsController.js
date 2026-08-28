@@ -21,8 +21,8 @@ const VIDEO_BUCKET = 'student-interview-videos';
 // give a little headroom here to avoid off-by-a-few-bytes rejections.
 export async function ensureStorageBucketLimits() {
   const targets = [
-    [VIDEO_BUCKET, 800 * 1024 * 1024],     // 800MB headroom over the 700MB app cap
-    [RECORDING_BUCKET, 200 * 1024 * 1024], // 200MB headroom over the 150MB app cap
+    [VIDEO_BUCKET, 700 * 1024 * 1024],     // matches the 700MB app cap (also the plan ceiling)
+    [RECORDING_BUCKET, 150 * 1024 * 1024], // matches the 150MB app cap (also the plan ceiling)
   ];
   for (const [bucket, size] of targets) {
     try {
@@ -136,10 +136,12 @@ async function resumableUploadToStorage(bucket, storagePath, filePath, mimeType,
     if (createRes.status === 413) {
       const limit = await getBucketLimit(bucket);
       const limitMb = limit ? `${(limit / 1024 / 1024).toFixed(0)}MB` : 'unknown';
+      const raw = await createRes.text().catch(() => '');
       throw new Error(
-        `File too large for storage bucket "${bucket}" (limit ${limitMb}). ` +
-        `The bucket size limit is lower than this file's ${(fileSize / 1024 / 1024).toFixed(0)}MB. ` +
-        `Raise the Supabase bucket file_size_limit / upgrade your plan.`
+        `Upload rejected by Supabase (413). Configured bucket limit is ${limitMb}, ` +
+        `but this file is ${(fileSize / 1024 / 1024).toFixed(0)}MB — Supabase's project/plan ` +
+        `maximum object size is lower than the bucket setting. Raw response: ${raw || '(none)'}. ` +
+        `Fix: raise the Supabase plan's max file size (or lower the app upload cap).`
       );
     }
     throw new Error(`Resumable session create failed (${createRes.status}): ${body}`);
